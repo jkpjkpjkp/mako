@@ -9,6 +9,7 @@ dependencies = [
     "cutensor-cu13>=2.6.0",
     "numpy>=2.4.3",
     "packaging>=26.0",
+    "pyscf>=2.12.1",
     "scipy>=1.17.1",
     "torch>=2.10.0",
     "triton>=3.6.0",

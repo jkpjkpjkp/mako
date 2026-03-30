@@ -22,6 +22,19 @@ TWO_POW_ONE_THIRD = 2.0 ** (1.0 / 3.0)
 
 
 @lru_cache(maxsize=1)
+def _load_libxc():
+    try:
+        from pyscf.dft import libxc
+    except Exception:
+        return None
+    return libxc
+
+
+def get_b3lyp_backend() -> str:
+    return "pyscf-libxc" if _load_libxc() is not None else "table"
+
+
+@lru_cache(maxsize=1)
 def _load_correlation_table() -> dict[str, cp.ndarray | float | int]:
     path = Path(__file__).with_name("b3lyp_correlation_table.npz")
     if not path.exists():
@@ -120,7 +133,7 @@ def _interpolate_correlation_table(
     )
 
 
-def evaluate_b3lyp_xc(
+def _evaluate_b3lyp_xc_table(
     rho: cp.ndarray,
     grad_norm: cp.ndarray,
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
@@ -140,3 +153,49 @@ def evaluate_b3lyp_xc(
     vrho = cp.where(active, exchange_vrho + corr_vrho, 0.0)
     vgrad = cp.where(active, exchange_vgrad + corr_vgrad, 0.0)
     return energy_density, vrho, vgrad
+
+
+def _evaluate_b3lyp_xc_libxc(
+    rho: cp.ndarray,
+    grad_norm: cp.ndarray,
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
+    libxc = _load_libxc()
+    if libxc is None:
+        raise RuntimeError("PySCF libxc backend is unavailable")
+
+    rho_safe = cp.maximum(rho, 0.0)
+    grad_safe = cp.maximum(grad_norm, 0.0)
+    rho_np = cp.asnumpy(rho_safe)
+    grad_np = cp.asnumpy(grad_safe)
+    zeros = np.zeros_like(rho_np)
+
+    exc, vxc, _, _ = libxc.eval_xc(
+        "B3LYP",
+        (rho_np, grad_np, zeros, zeros),
+        spin=0,
+        deriv=1,
+    )
+
+    energy_density = rho_np * exc
+    vrho = np.asarray(vxc[0], dtype=np.float64)
+    # LibXC returns d(rho * exc) / d sigma with sigma = |grad rho|^2.
+    vgrad = 2.0 * grad_np * np.asarray(vxc[1], dtype=np.float64)
+
+    active = rho_np > RHO_FLOOR
+    energy_density = np.where(active, energy_density, 0.0)
+    vrho = np.where(active, vrho, 0.0)
+    vgrad = np.where(active, vgrad, 0.0)
+    return (
+        cp.asarray(energy_density, dtype=cp.float64),
+        cp.asarray(vrho, dtype=cp.float64),
+        cp.asarray(vgrad, dtype=cp.float64),
+    )
+
+
+def evaluate_b3lyp_xc(
+    rho: cp.ndarray,
+    grad_norm: cp.ndarray,
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
+    if _load_libxc() is not None:
+        return _evaluate_b3lyp_xc_libxc(rho, grad_norm)
+    return _evaluate_b3lyp_xc_table(rho, grad_norm)

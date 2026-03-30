@@ -10,7 +10,7 @@ from pathlib import Path
 import cupy as cp
 import numpy as np
 
-from b3lyp_xc import B3LYP_EXACT_EXCHANGE, evaluate_b3lyp_xc
+from b3lyp_xc import B3LYP_EXACT_EXCHANGE, evaluate_b3lyp_xc, get_b3lyp_backend
 
 
 ANGSTROM_TO_BOHR = 1.8897259886
@@ -65,6 +65,13 @@ class BasisFunction:
     coeffs: np.ndarray
 
 
+@dataclass(frozen=True)
+class Shell:
+    center: np.ndarray
+    ang_momentum: int
+    basis_indices: tuple[int, ...]
+
+
 class DIIS:
     def __init__(self, max_vectors: int = 6) -> None:
         self.max_vectors = max_vectors
@@ -112,7 +119,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Self-contained restricted HF / B3LYP SCF using analytic Gaussian "
-            "integrals, a CuPy-backed SCF loop, and a baked B3LYP semilocal XC table."
+            "integrals, a CuPy-backed SCF loop, and an exact PySCF/libxc B3LYP "
+            "semilocal XC backend with a baked fallback."
         )
     )
     parser.add_argument(
@@ -283,19 +291,37 @@ def cartesian_tuples(total_ang_momentum: int) -> tuple[tuple[int, int, int], ...
     return tuple(terms)
 
 
-def build_basis_functions(
+def build_shells_and_basis_functions(
     atoms: list[Atom],
     parsed_basis: dict[str, list[ShellSpec]],
-) -> list[BasisFunction]:
+) -> tuple[list[Shell], list[BasisFunction]]:
     shell_to_l = {"S": 0, "P": 1, "D": 2, "F": 3}
+    shells: list[Shell] = []
     functions: list[BasisFunction] = []
     for atom in atoms:
         if atom.symbol not in parsed_basis:
             raise ValueError(f"No basis found for element {atom.symbol}")
         for shell in parsed_basis[atom.symbol]:
             ang_momentum = shell_to_l[shell.shell_type]
+            start = len(functions)
             for ang in cartesian_tuples(ang_momentum):
                 functions.append(make_basis_function(atom.coord, ang, shell))
+            stop = len(functions)
+            shells.append(
+                Shell(
+                    center=atom.coord,
+                    ang_momentum=ang_momentum,
+                    basis_indices=tuple(range(start, stop)),
+                )
+            )
+    return shells, functions
+
+
+def build_basis_functions(
+    atoms: list[Atom],
+    parsed_basis: dict[str, list[ShellSpec]],
+) -> list[BasisFunction]:
+    _, functions = build_shells_and_basis_functions(atoms, parsed_basis)
     return functions
 
 
@@ -634,9 +660,178 @@ def contracted_eri(
     return value
 
 
+@lru_cache(maxsize=None)
+def hermite_tensor_indices(max_axis_ang_momentum: int) -> tuple[tuple[int, int, int], ...]:
+    return tuple(
+        (t, u, v)
+        for t in range(max_axis_ang_momentum + 1)
+        for u in range(max_axis_ang_momentum + 1)
+        for v in range(max_axis_ang_momentum + 1)
+    )
+
+
+def shell_basis_functions(
+    shell: Shell,
+    basis_functions: list[BasisFunction],
+) -> list[BasisFunction]:
+    return [basis_functions[index] for index in shell.basis_indices]
+
+
+def primitive_shell_pair_transform(
+    shell_a: Shell,
+    shell_b: Shell,
+    basis_functions: list[BasisFunction],
+    primitive_a: int,
+    primitive_b: int,
+    alpha: float,
+    beta: float,
+) -> tuple[np.ndarray, tuple[tuple[int, int, int], ...]]:
+    basis_a = shell_basis_functions(shell_a, basis_functions)
+    basis_b = shell_basis_functions(shell_b, basis_functions)
+    terms = hermite_tensor_indices(shell_a.ang_momentum + shell_b.ang_momentum)
+    transform = np.zeros((len(basis_a) * len(basis_b), len(terms)), dtype=float)
+
+    ab = shell_a.center - shell_b.center
+    for row_a, bf_a in enumerate(basis_a):
+        coeff_a = bf_a.coeffs[primitive_a]
+        ax, ay, az = bf_a.ang
+        for row_b, bf_b in enumerate(basis_b):
+            coeff_b = bf_b.coeffs[primitive_b]
+            bx, by, bz = bf_b.ang
+            row = row_a * len(basis_b) + row_b
+            scale = coeff_a * coeff_b
+            for col, (t, u, v) in enumerate(terms):
+                transform[row, col] = scale * (
+                    hermite_coefficient(ax, bx, t, ab[0], alpha, beta)
+                    * hermite_coefficient(ay, by, u, ab[1], alpha, beta)
+                    * hermite_coefficient(az, bz, v, ab[2], alpha, beta)
+                )
+
+    return transform, terms
+
+
+def compute_r_integrals(
+    max_t: int,
+    max_u: int,
+    max_v: int,
+    alpha_eri: float,
+    pq: np.ndarray,
+    rpq2: float,
+) -> np.ndarray:
+    r = np.empty((max_t + 1, max_u + 1, max_v + 1), dtype=float)
+    for t in range(max_t + 1):
+        for u in range(max_u + 1):
+            for v in range(max_v + 1):
+                r[t, u, v] = coulomb_auxiliary(
+                    t,
+                    u,
+                    v,
+                    0,
+                    alpha_eri,
+                    float(pq[0]),
+                    float(pq[1]),
+                    float(pq[2]),
+                    rpq2,
+                )
+    return r
+
+
+def compute_pq_integrals(
+    ab_terms: tuple[tuple[int, int, int], ...],
+    cd_terms: tuple[tuple[int, int, int], ...],
+    r_integrals: np.ndarray,
+) -> np.ndarray:
+    pq_integrals = np.empty((len(ab_terms), len(cd_terms)), dtype=float)
+    for row, (t, u, v) in enumerate(ab_terms):
+        for col, (tau, nu, phi) in enumerate(cd_terms):
+            pq_integrals[row, col] = ((-1) ** (tau + nu + phi)) * r_integrals[
+                t + tau,
+                u + nu,
+                v + phi,
+            ]
+    return pq_integrals
+
+
+def shell_quartet_block(
+    shell_a: Shell,
+    shell_b: Shell,
+    shell_c: Shell,
+    shell_d: Shell,
+    basis_functions: list[BasisFunction],
+) -> np.ndarray:
+    basis_a = shell_basis_functions(shell_a, basis_functions)
+    basis_b = shell_basis_functions(shell_b, basis_functions)
+    basis_c = shell_basis_functions(shell_c, basis_functions)
+    basis_d = shell_basis_functions(shell_d, basis_functions)
+
+    ref_a = basis_a[0]
+    ref_b = basis_b[0]
+    ref_c = basis_c[0]
+    ref_d = basis_d[0]
+
+    block = np.zeros((len(basis_a) * len(basis_b), len(basis_c) * len(basis_d)), dtype=float)
+    product_ab_terms: dict[tuple[int, int], tuple[np.ndarray, tuple[tuple[int, int, int], ...], float, np.ndarray]] = {}
+
+    for primitive_a, alpha in enumerate(ref_a.exponents):
+        for primitive_b, beta in enumerate(ref_b.exponents):
+            e_ab, ab_terms = primitive_shell_pair_transform(
+                shell_a,
+                shell_b,
+                basis_functions,
+                primitive_a,
+                primitive_b,
+                alpha,
+                beta,
+            )
+            p = alpha + beta
+            product_ab_terms[(primitive_a, primitive_b)] = (
+                e_ab,
+                ab_terms,
+                p,
+                gaussian_product_center(alpha, shell_a.center, beta, shell_b.center),
+            )
+
+    for primitive_a, primitive_b in product_ab_terms:
+        e_ab, ab_terms, p, product_ab = product_ab_terms[(primitive_a, primitive_b)]
+        alpha = ref_a.exponents[primitive_a]
+        beta = ref_b.exponents[primitive_b]
+
+        for primitive_c, gamma in enumerate(ref_c.exponents):
+            for primitive_d, delta in enumerate(ref_d.exponents):
+                e_cd, cd_terms = primitive_shell_pair_transform(
+                    shell_c,
+                    shell_d,
+                    basis_functions,
+                    primitive_c,
+                    primitive_d,
+                    gamma,
+                    delta,
+                )
+                q = gamma + delta
+                product_cd = gaussian_product_center(gamma, shell_c.center, delta, shell_d.center)
+                pq = product_ab - product_cd
+                rpq2 = float(np.dot(pq, pq))
+                alpha_eri = p * q / (p + q)
+
+                r_integrals = compute_r_integrals(
+                    shell_a.ang_momentum + shell_b.ang_momentum + shell_c.ang_momentum + shell_d.ang_momentum,
+                    shell_a.ang_momentum + shell_b.ang_momentum + shell_c.ang_momentum + shell_d.ang_momentum,
+                    shell_a.ang_momentum + shell_b.ang_momentum + shell_c.ang_momentum + shell_d.ang_momentum,
+                    alpha_eri,
+                    pq,
+                    rpq2,
+                )
+                pq_integrals = compute_pq_integrals(ab_terms, cd_terms, r_integrals)
+                prefactor = 2.0 * math.pi**2.5 / (p * q * math.sqrt(p + q))
+                block += prefactor * (e_ab @ pq_integrals @ e_cd.T)
+
+    return block.reshape(len(basis_a), len(basis_b), len(basis_c), len(basis_d))
+
+
 def build_integrals(
     atoms: list[Atom],
     basis_functions: list[BasisFunction],
+    shells: list[Shell],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     nbf = len(basis_functions)
     overlap = np.zeros((nbf, nbf), dtype=float)
@@ -649,28 +844,33 @@ def build_integrals(
             overlap[i, j] = overlap[j, i] = s_ij
             core_h[i, j] = core_h[j, i] = t_ij + v_ij
 
-    for i in range(nbf):
-        for j in range(i + 1):
-            ij = i * (i + 1) // 2 + j
-            for k in range(nbf):
-                for l in range(k + 1):
-                    kl = k * (k + 1) // 2 + l
+    for shell_i, shell_a in enumerate(shells):
+        a_idx = shell_a.basis_indices
+        for shell_j, shell_b in enumerate(shells[: shell_i + 1]):
+            b_idx = shell_b.basis_indices
+            ij = shell_i * (shell_i + 1) // 2 + shell_j
+            for shell_k, shell_c in enumerate(shells):
+                c_idx = shell_c.basis_indices
+                for shell_l, shell_d in enumerate(shells[: shell_k + 1]):
+                    d_idx = shell_d.basis_indices
+                    kl = shell_k * (shell_k + 1) // 2 + shell_l
                     if ij < kl:
                         continue
-                    value = contracted_eri(
-                        basis_functions[i],
-                        basis_functions[j],
-                        basis_functions[k],
-                        basis_functions[l],
-                    )
-                    eri[i, j, k, l] = value
-                    eri[j, i, k, l] = value
-                    eri[i, j, l, k] = value
-                    eri[j, i, l, k] = value
-                    eri[k, l, i, j] = value
-                    eri[l, k, i, j] = value
-                    eri[k, l, j, i] = value
-                    eri[l, k, j, i] = value
+
+                    block = shell_quartet_block(shell_a, shell_b, shell_c, shell_d, basis_functions)
+                    for local_a, global_a in enumerate(a_idx):
+                        for local_b, global_b in enumerate(b_idx):
+                            for local_c, global_c in enumerate(c_idx):
+                                for local_d, global_d in enumerate(d_idx):
+                                    value = block[local_a, local_b, local_c, local_d]
+                                    eri[global_a, global_b, global_c, global_d] = value
+                                    eri[global_b, global_a, global_c, global_d] = value
+                                    eri[global_a, global_b, global_d, global_c] = value
+                                    eri[global_b, global_a, global_d, global_c] = value
+                                    eri[global_c, global_d, global_a, global_b] = value
+                                    eri[global_d, global_c, global_a, global_b] = value
+                                    eri[global_c, global_d, global_b, global_a] = value
+                                    eri[global_d, global_c, global_b, global_a] = value
 
     return overlap, core_h, eri
 
@@ -962,15 +1162,17 @@ def main() -> None:
     parsed_basis = parse_orca_basis(args.basis)
     geometry = get_geometry(args)
     atoms, nelec = build_atoms(geometry, args.charge)
-    basis_functions = build_basis_functions(atoms, parsed_basis)
+    shells, basis_functions = build_shells_and_basis_functions(atoms, parsed_basis)
 
     if args.verbose:
         print(f"building one- and two-electron integrals for {len(basis_functions)} basis functions")
-    overlap, core_h, eri = build_integrals(atoms, basis_functions)
+    overlap, core_h, eri = build_integrals(atoms, basis_functions, shells)
     e_nuc = nuclear_repulsion_energy(atoms)
 
     grid_points = grid_weights = None
     if args.method == "b3lyp":
+        if args.verbose:
+            print(f"using B3LYP XC backend: {get_b3lyp_backend()}")
         if args.verbose:
             print(
                 f"building multicenter grid with {args.grid_radial} radial x "
@@ -1015,6 +1217,7 @@ def main() -> None:
         "num_basis_functions": len(basis_functions),
         "orbital_energies_hartree": scf["orbital_energies_hartree"],
         "scf_history": scf["history"],
+        "xc_backend": get_b3lyp_backend() if args.method == "b3lyp" else None,
         "system": [
             {
                 "symbol": atom.symbol,
