@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from b3lyp_xc import B3LYP_EXACT_EXCHANGE, evaluate_b3lyp_xc, get_b3lyp_backend
+from eri import batched_hermite_tensor, build_eri_tensor, compute_r_integrals_batched
 
 
 ANGSTROM_TO_BOHR = 1.8897259886
@@ -280,78 +281,6 @@ def hermite_coefficient(i: int, j: int, t: int, qx: float, alpha: float, beta: f
             + (t + 1) * hermite_coefficient(i, j - 1, t + 1, qx, alpha, beta))
 
 
-# =========================================================================================
-# Vectorized Analytical Integrals Engine (PyTorch)
-# =========================================================================================
-
-def boys_gpu(n: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    mask = x > 1e-8
-    x_safe = torch.where(mask, x, torch.ones_like(x) * 1e-8)
-    a = n + 0.5
-    gamma_a = torch.exp(torch.lgamma(a))
-    val = gamma_a * torch.special.gammainc(a, x_safe) / (2.0 * x_safe ** a)
-    taylor = 1.0 / (2.0 * n + 1.0) - x / (2.0 * n + 3.0)
-    return torch.where(mask, val, taylor)
-
-
-def compute_r_integrals_batched(
-    max_t: int, max_u: int, max_v: int,
-    alpha_eri: torch.Tensor, pq: torch.Tensor, rpq2: torch.Tensor
-) -> torch.Tensor:
-    B_size = alpha_eri.shape[0]
-    device, dtype = alpha_eri.device, alpha_eri.dtype
-
-    def build_C(max_val, pc):
-        C = torch.zeros((B_size, max_val + 1, max_val + 1), dtype=dtype, device=device)
-        C[:, 0, 0] = 1.0
-        if max_val > 0: C[:, 1, 1] = pc
-        for k in range(2, max_val + 1):
-            C[:, k, 1:] = pc.unsqueeze(1) * C[:, k-1, :-1] + (k-1) * C[:, k-2, :-1]
-        return C
-
-    Cx, Cy, Cz = build_C(max_t, pq[:, 0]), build_C(max_u, pq[:, 1]), build_C(max_v, pq[:, 2])
-
-    max_n = max_t + max_u + max_v
-    n_idx = torch.arange(max_n + 1, device=device, dtype=dtype)
-    n_exp, p_exp = n_idx.unsqueeze(1), alpha_eri.unsqueeze(0)
-    x_exp = (alpha_eri * rpq2).unsqueeze(0)
-
-    boys_vals = boys_gpu(n_exp, x_exp)
-    sign_n = torch.where(n_idx % 2 == 0, torch.tensor(1.0, dtype=dtype, device=device), torch.tensor(-1.0, dtype=dtype, device=device))
-    F = (sign_n.unsqueeze(1) * ((2.0 * p_exp) ** n_exp) * boys_vals).t()
-
-    i = torch.arange(max_t + 1, device=device)[:, None, None]
-    j = torch.arange(max_u + 1, device=device)[None, :, None]
-    k = torch.arange(max_v + 1, device=device)[None, None, :]
-
-    return torch.einsum('bti, buj, bvk, bijk -> btuv', Cx, Cy, Cz, F[:, i + j + k])
-
-
-def batched_hermite_tensor(
-    max_ang_a: int, max_ang_b: int, A_minus_B: torch.Tensor,
-    alpha: torch.Tensor, beta: torch.Tensor, p: torch.Tensor
-) -> torch.Tensor:
-    B, device, dtype = alpha.shape[0], alpha.device, alpha.dtype
-    E = torch.zeros((max_ang_a + 1, max_ang_b + 1, max_ang_a + max_ang_b + 1, B), dtype=dtype, device=device)
-    E[0, 0, 0, :] = torch.exp(-((alpha * beta) / p) * (A_minus_B ** 2))
-
-    for i in range(max_ang_a + 1):
-        for j in range(max_ang_b + 1):
-            if i == 0 and j == 0: continue
-            for t in range(i + j + 1):
-                val = torch.zeros(B, dtype=dtype, device=device)
-                if i > 0:
-                    if t > 0: val += (1.0 / (2.0 * p)) * E[i-1, j, t-1, :]
-                    val += -(beta / p) * A_minus_B * E[i-1, j, t, :]
-                    if t + 1 <= i + j - 1: val += (t + 1) * E[i-1, j, t+1, :]
-                else:
-                    if t > 0: val += (1.0 / (2.0 * p)) * E[i, j-1, t-1, :]
-                    val += (alpha / p) * A_minus_B * E[i, j-1, t, :]
-                    if t + 1 <= i + j - 1: val += (t + 1) * E[i, j-1, t+1, :]
-                E[i, j, t, :] = val
-    return E.permute(3, 0, 1, 2)
-
-
 @torch.no_grad()
 def build_integrals(
     atoms: list[Atom], basis_functions: list[BasisFunction], shells: list[Shell],
@@ -452,126 +381,13 @@ def build_integrals(
         overlap_gpu.index_put_((A_flat, B_flat), S_flat); overlap_gpu.index_put_((B_flat, A_flat), S_flat)
         core_h_gpu.index_put_((A_flat, B_flat), H_flat); core_h_gpu.index_put_((B_flat, A_flat), H_flat)
 
-    # ---------------- 2-Electron ERIs (Massive VRAM Chunks) ----------------
-    quartet_groups = defaultdict(list)
-    for i, shell_a in enumerate(shells):
-        for j, shell_b in enumerate(shells[:i+1]):
-            ij = i * (i + 1) // 2 + j
-            for k, shell_c in enumerate(shells):
-                for l, shell_d in enumerate(shells[:k+1]):
-                    if ij < k * (k + 1) // 2 + l: continue
-                    K_a, K_b, K_c, K_d = len(basis_functions[shell_a.basis_indices[0]].exponents), len(basis_functions[shell_b.basis_indices[0]].exponents), len(basis_functions[shell_c.basis_indices[0]].exponents), len(basis_functions[shell_d.basis_indices[0]].exponents)
-                    quartet_groups[(shell_a.ang_momentum, shell_b.ang_momentum, shell_c.ang_momentum, shell_d.ang_momentum, K_a, K_b, K_c, K_d)].append((i, j, k, l))
-
-    for key, quartets in quartet_groups.items():
-        Q = len(quartets)
-        L_a, L_b, L_c, L_d, K_a, K_b, K_c, K_d = key
-        K_total = K_a * K_b * K_c * K_d
-        cart_A, cart_B, cart_C, cart_D = cartesian_tuples(L_a), cartesian_tuples(L_b), cartesian_tuples(L_c), cartesian_tuples(L_d)
-
-        def get_idx(cart, dim): return torch.tensor(np.array([ang[dim] for ang in cart]), dtype=torch.long, device=device)
-        idx_A, idx_B = [get_idx(cart_A, d) for d in range(3)], [get_idx(cart_B, d) for d in range(3)]
-        idx_c_x, idx_d_x = torch.meshgrid(get_idx(cart_C, 0), get_idx(cart_D, 0), indexing='ij')
-        idx_c_y, idx_d_y = torch.meshgrid(get_idx(cart_C, 1), get_idx(cart_D, 1), indexing='ij')
-        idx_c_z, idx_d_z = torch.meshgrid(get_idx(cart_C, 2), get_idx(cart_D, 2), indexing='ij')
-
-        A_centers = torch.tensor(np.array([shells[q[0]].center for q in quartets]), device=device, dtype=dtype)
-        B_centers = torch.tensor(np.array([shells[q[1]].center for q in quartets]), device=device, dtype=dtype)
-        C_centers = torch.tensor(np.array([shells[q[2]].center for q in quartets]), device=device, dtype=dtype)
-        D_centers = torch.tensor(np.array([shells[q[3]].center for q in quartets]), device=device, dtype=dtype)
-
-        A_exp = torch.tensor(np.array([basis_functions[shells[q[0]].basis_indices[0]].exponents for q in quartets]), device=device, dtype=dtype)
-        B_exp = torch.tensor(np.array([basis_functions[shells[q[1]].basis_indices[0]].exponents for q in quartets]), device=device, dtype=dtype)
-        C_exp = torch.tensor(np.array([basis_functions[shells[q[2]].basis_indices[0]].exponents for q in quartets]), device=device, dtype=dtype)
-        D_exp = torch.tensor(np.array([basis_functions[shells[q[3]].basis_indices[0]].exponents for q in quartets]), device=device, dtype=dtype)
-
-        A_coef = torch.tensor(np.array([basis_functions[shells[q[0]].basis_indices[0]].coeffs for q in quartets]), device=device, dtype=dtype)
-        B_coef = torch.tensor(np.array([basis_functions[shells[q[1]].basis_indices[0]].coeffs for q in quartets]), device=device, dtype=dtype)
-        C_coef = torch.tensor(np.array([basis_functions[shells[q[2]].basis_indices[0]].coeffs for q in quartets]), device=device, dtype=dtype)
-        D_coef = torch.tensor(np.array([basis_functions[shells[q[3]].basis_indices[0]].coeffs for q in quartets]), device=device, dtype=dtype)
-
-        g_a, g_b, g_c, g_d = torch.meshgrid(torch.arange(K_a), torch.arange(K_b), torch.arange(K_c), torch.arange(K_d), indexing='ij')
-        g_a, g_b, g_c, g_d = g_a.flatten(), g_b.flatten(), g_c.flatten(), g_d.flatten()
-
-        # Safely constrain huge batch volumes preserving 512 MB memory footprint maximum
-        max_t_all = L_a + L_b + L_c + L_d + 1
-        bytes_per_prim = 8 * (3 * (L_a+L_b+1)**2 + 3 * (L_c+L_d+1)**2 + 3 * (L_a+1)*(L_b+1)*(L_c+1)*(L_d+1)*max_t_all + max_t_all**3 + len(cart_A)*len(cart_B)*len(cart_C)*len(cart_D))
-        Q_chunk_size = max(1, max(1, (512 * 1024 * 1024) // bytes_per_prim) // K_total)
-
-        I_abcd_Q = torch.zeros((Q, len(cart_A), len(cart_B), len(cart_C), len(cart_D)), dtype=dtype, device=device)
-
-        for chunk_start in range(0, Q, Q_chunk_size):
-            chunk_end = min(Q, chunk_start + Q_chunk_size)
-            Q_c, B_c = chunk_end - chunk_start, (chunk_end - chunk_start) * K_total
-
-            alpha = A_exp[chunk_start:chunk_end][:, g_a].reshape(-1)
-            beta = B_exp[chunk_start:chunk_end][:, g_b].reshape(-1)
-            gamma = C_exp[chunk_start:chunk_end][:, g_c].reshape(-1)
-            delta = D_exp[chunk_start:chunk_end][:, g_d].reshape(-1)
-            coeffs = (A_coef[chunk_start:chunk_end][:, g_a] * B_coef[chunk_start:chunk_end][:, g_b] * C_coef[chunk_start:chunk_end][:, g_c] * D_coef[chunk_start:chunk_end][:, g_d]).reshape(-1)
-
-            A_c = A_centers[chunk_start:chunk_end].unsqueeze(1).expand(Q_c, K_total, 3).reshape(-1, 3)
-            B_c_tensor = B_centers[chunk_start:chunk_end].unsqueeze(1).expand(Q_c, K_total, 3).reshape(-1, 3)
-            C_c = C_centers[chunk_start:chunk_end].unsqueeze(1).expand(Q_c, K_total, 3).reshape(-1, 3)
-            D_c = D_centers[chunk_start:chunk_end].unsqueeze(1).expand(Q_c, K_total, 3).reshape(-1, 3)
-
-            p, q = alpha + beta, gamma + delta
-            P, Q_pt = (alpha[:, None] * A_c + beta[:, None] * B_c_tensor) / p[:, None], (gamma[:, None] * C_c + delta[:, None] * D_c) / q[:, None]
-            PQ = P - Q_pt
-
-            Ex_ab = batched_hermite_tensor(L_a, L_b, A_c[:, 0] - B_c_tensor[:, 0], alpha, beta, p)
-            Ey_ab = batched_hermite_tensor(L_a, L_b, A_c[:, 1] - B_c_tensor[:, 1], alpha, beta, p)
-            Ez_ab = batched_hermite_tensor(L_a, L_b, A_c[:, 2] - B_c_tensor[:, 2], alpha, beta, p)
-            Ex_cd = batched_hermite_tensor(L_c, L_d, C_c[:, 0] - D_c[:, 0], gamma, delta, q)
-            Ey_cd = batched_hermite_tensor(L_c, L_d, C_c[:, 1] - D_c[:, 1], gamma, delta, q)
-            Ez_cd = batched_hermite_tensor(L_c, L_d, C_c[:, 2] - D_c[:, 2], gamma, delta, q)
-
-            def convolve(E_ab, E_cd):
-                B_v, I_v, J_v, T_v = E_ab.shape
-                _, K_v, L_v, TAU_v = E_cd.shape
-                G = torch.zeros((B_v, I_v, J_v, K_v, L_v, T_v + TAU_v - 1), dtype=dtype, device=device)
-                for t in range(T_v):
-                    for tau in range(TAU_v):
-                        sign = 1.0 if tau % 2 == 0 else -1.0
-                        G[..., t + tau] += E_ab[..., t].unsqueeze(3).unsqueeze(4) * E_cd[..., tau].unsqueeze(1).unsqueeze(2) * sign
-                return G
-
-            Gx, Gy, Gz = convolve(Ex_ab, Ex_cd), convolve(Ey_ab, Ey_cd), convolve(Ez_ab, Ez_cd)
-            R = compute_r_integrals_batched(max_t_all - 1, max_t_all - 1, max_t_all - 1, p * q / (p + q), PQ, torch.sum(PQ**2, dim=1))
-            weighted_coeffs = coeffs * (2.0 * math.pi**2.5 / (p * q * torch.sqrt(p + q)))
-
-            I_abcd = torch.zeros((B_c, len(cart_A), len(cart_B), len(cart_C), len(cart_D)), dtype=dtype, device=device)
-            for a in range(len(cart_A)):
-                for b in range(len(cart_B)):
-                    gx = Gx[:, idx_A[0][a], idx_B[0][b], idx_c_x, idx_d_x, :]
-                    gy = Gy[:, idx_A[1][a], idx_B[1][b], idx_c_y, idx_d_y, :]
-                    gz = Gz[:, idx_A[2][a], idx_B[2][b], idx_c_z, idx_d_z, :]
-                    I_abcd[:, a, b, :, :] = torch.einsum('ncdt, ncdu, ncdv, ntuv -> ncd', gx, gy, gz, R) * weighted_coeffs[:, None, None]
-
-            I_abcd_Q[chunk_start:chunk_end] = I_abcd.view(Q_c, K_total, len(cart_A), len(cart_B), len(cart_C), len(cart_D)).sum(dim=1)
-
-        a_idx = torch.tensor(np.array([shells[q[0]].basis_indices for q in quartets]), device=device)
-        b_idx = torch.tensor(np.array([shells[q[1]].basis_indices for q in quartets]), device=device)
-        c_idx = torch.tensor(np.array([shells[q[2]].basis_indices for q in quartets]), device=device)
-        d_idx = torch.tensor(np.array([shells[q[3]].basis_indices for q in quartets]), device=device)
-
-        A_mesh = a_idx.view(Q, len(cart_A), 1, 1, 1).expand(Q, len(cart_A), len(cart_B), len(cart_C), len(cart_D))
-        B_mesh = b_idx.view(Q, 1, len(cart_B), 1, 1).expand(Q, len(cart_A), len(cart_B), len(cart_C), len(cart_D))
-        C_mesh = c_idx.view(Q, 1, 1, len(cart_C), 1).expand(Q, len(cart_A), len(cart_B), len(cart_C), len(cart_D))
-        D_mesh = d_idx.view(Q, 1, 1, 1, len(cart_D)).expand(Q, len(cart_A), len(cart_B), len(cart_C), len(cart_D))
-
-        V_flat = I_abcd_Q.reshape(-1)
-        A_flat, B_flat, C_flat, D_flat = A_mesh.reshape(-1), B_mesh.reshape(-1), C_mesh.reshape(-1), D_mesh.reshape(-1)
-
-        # Implicit dense PyTorch assignments handles symmetries natively
-        eri_gpu.index_put_((A_flat, B_flat, C_flat, D_flat), V_flat)
-        eri_gpu.index_put_((B_flat, A_flat, C_flat, D_flat), V_flat)
-        eri_gpu.index_put_((A_flat, B_flat, D_flat, C_flat), V_flat)
-        eri_gpu.index_put_((B_flat, A_flat, D_flat, C_flat), V_flat)
-        eri_gpu.index_put_((C_flat, D_flat, A_flat, B_flat), V_flat)
-        eri_gpu.index_put_((D_flat, C_flat, A_flat, B_flat), V_flat)
-        eri_gpu.index_put_((C_flat, D_flat, B_flat, A_flat), V_flat)
-        eri_gpu.index_put_((D_flat, C_flat, B_flat, A_flat), V_flat)
+    eri_gpu = build_eri_tensor(
+        basis_functions=basis_functions,
+        shells=shells,
+        cartesian_tuples=cartesian_tuples,
+        device=device,
+        dtype=dtype,
+    )
 
     return overlap_gpu, core_h_gpu, eri_gpu
 
