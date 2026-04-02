@@ -6,6 +6,8 @@ from pathlib import Path
 import cupy as cp
 import numpy as np
 
+Array = np.ndarray | cp.ndarray
+
 
 B3LYP_EXACT_EXCHANGE = 0.20
 B88_EXCHANGE_WEIGHT = 0.72
@@ -192,10 +194,37 @@ def _evaluate_b3lyp_xc_libxc(
     )
 
 
+def _normalize_xc_inputs(rho: Array, grad_norm: Array) -> tuple[cp.ndarray, cp.ndarray, bool]:
+    return_numpy = isinstance(rho, np.ndarray) or isinstance(grad_norm, np.ndarray)
+    rho_cp = cp.asarray(rho, dtype=cp.float64)
+    grad_norm_cp = cp.asarray(grad_norm, dtype=cp.float64)
+    return rho_cp, grad_norm_cp, return_numpy
+
+
+def _restore_xc_outputs(
+    energy_density: cp.ndarray,
+    vrho: cp.ndarray,
+    vgrad: cp.ndarray,
+    *,
+    return_numpy: bool,
+) -> tuple[Array, Array, Array]:
+    if return_numpy:
+        return cp.asnumpy(energy_density), cp.asnumpy(vrho), cp.asnumpy(vgrad)
+    return energy_density, vrho, vgrad
+
+
 def evaluate_b3lyp_xc(
-    rho: cp.ndarray,
-    grad_norm: cp.ndarray,
-) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
+    rho: Array,
+    grad_norm: Array,
+) -> tuple[Array, Array, Array]:
+    rho_cp, grad_norm_cp, return_numpy = _normalize_xc_inputs(rho, grad_norm)
     if _load_libxc() is not None:
-        return _evaluate_b3lyp_xc_libxc(rho, grad_norm)
-    return _evaluate_b3lyp_xc_table(rho, grad_norm)
+        energy_density, vrho, vgrad = _evaluate_b3lyp_xc_libxc(rho_cp, grad_norm_cp)
+    else:
+        energy_density, vrho, vgrad = _evaluate_b3lyp_xc_table(rho_cp, grad_norm_cp)
+    return _restore_xc_outputs(
+        energy_density,
+        vrho,
+        vgrad,
+        return_numpy=return_numpy,
+    )

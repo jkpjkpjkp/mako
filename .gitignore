@@ -11,3 +11,4 @@ wheels/
 uv.lock
 /*.npz
 /*.nsys-rep
+/*.log
